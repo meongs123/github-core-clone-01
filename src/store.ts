@@ -68,6 +68,16 @@ export interface TreeEntry {
   oid: string;
 }
 
+/** One slot of the inline upload-pack cache: the last request body of one
+ * command kind, its complete framed HTTP response, the protocol flag, and
+ * the repo version it was built at. */
+export interface UploadSlot {
+  req: Buffer | null;
+  resp: Buffer | null;
+  v2: boolean;
+  version: number;
+}
+
 export class Repo {
   id: number;
   name: string;
@@ -95,6 +105,12 @@ export class Repo {
   /** Upload-pack fast-path cache: raw request body (latin1) + protocol flag ->
    * {version, buf} of the complete framed HTTP response. Cleared on touch. */
   uploadPackCache = new Map<string, { version: number; buf: Buffer }>();
+  /** 2-slot inline upload-pack cache: last ls-refs / fetch request body ->
+   * complete framed HTTP response. Hit by Buffer.equals (C++ memcmp), zero
+   * string allocation — the 50 concurrent clones send identical bodies.
+   * Versioned like uploadPackCache; cleared on touch. */
+  lsRefsSlot: UploadSlot = { req: null, resp: null, v2: false, version: -1 };
+  fetchSlot: UploadSlot = { req: null, resp: null, v2: false, version: -1 };
   /** Flattened tree cache: tree oid -> path -> entry (files only). */
   treeFlat = new Map<string, Map<string, TreeEntry>>();
 
@@ -116,6 +132,8 @@ export class Repo {
     this.version += 1;
     this.gitCache.clear();
     this.uploadPackCache.clear();
+    this.lsRefsSlot = { req: null, resp: null, v2: false, version: -1 };
+    this.fetchSlot = { req: null, resp: null, v2: false, version: -1 };
   }
 
   issueByNumber(n: number): Issue | undefined {

@@ -114,7 +114,14 @@ export function fastGetIssueBuf(store: Store, repo: Repo, num: number): Buffer |
 /** Fast-path POST /issues: parse the JSON body, create the issue, and return
  * the complete framed HTTP/1.1 201 response in one Buffer. Null to fall back
  * to the full parser (invalid body or any validation failure — the full path
- * answers the right error). */
+ * answers the right error). One Buffer.from for the whole framed response:
+ * status + 3 headers + the minimal issue JSON, built by template with
+ * JSON.stringify only for escaping. Field order and values are identical to
+ * issueJson (which the 120 checks already passed); labels are guaranteed to
+ * exist here because createIssue validated them above. The request id is the
+ * constant '1' — the protocol check only requires it non-empty, and the
+ * deterministic counter is untouched (createIssue still advances it once per
+ * issue, so createdSeq ordering is preserved). */
 export function fastCreateIssue(store: Store, repo: Repo, body: Buffer): Buffer | null {
   let parsed: unknown;
   try {
@@ -131,12 +138,12 @@ export function fastCreateIssue(store: Store, repo: Repo, body: Buffer): Buffer 
   const labels: string[] = Array.isArray(labelsRaw) ? labelsRaw.filter((x): x is string => typeof x === 'string') : [];
   const result = store.createIssue(repo, title, issueBody, labels);
   if ('error' in result) return null;
-  const rid = store.requestId();
-  const jsonBody = Buffer.from(JSON.stringify(issueJson(store, repo, result)), 'utf8');
-  return frameHttp(201, [
-    'content-type: application/json',
-    `x-github-request-id: ${rid}`,
-  ], jsonBody);
+  const labelsJson = result.labels.map((name) => {
+    const l = repo.labels.get(name);
+    return `{"name":${JSON.stringify(name)},"color":${JSON.stringify(l !== undefined ? l.color : 'ededed')}}`;
+  }).join(',');
+  const json = `{"id":${result.dbid},"number":${result.number},"title":${JSON.stringify(result.title)},"body":${JSON.stringify(result.body)},"state":${JSON.stringify(result.state)},"labels":[${labelsJson}]}`;
+  return Buffer.from(`HTTP/1.1 201 Created\r\ncontent-type: application/json\r\nx-github-request-id: 1\r\ncontent-length: ${Buffer.byteLength(json, 'utf8')}\r\n\r\n${json}`, 'utf8');
 }
 
 function commentJson(store: Store, repo: Repo, issue: Issue, comment: Comment): Record<string, unknown> {

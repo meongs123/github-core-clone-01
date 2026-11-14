@@ -1,7 +1,7 @@
 // Git smart HTTP: upload-pack v2/v0, receive-pack v0, ls-refs, fetch, push.
 // Wire formats follow the kit's git-client exactly (see spec/git-spec.md).
 import { pkt, pktLines, PKT_FLUSH, sideband, ZERO_OID, parseHex4 } from './util.ts';
-import { writePack, readPack, parseTag, parseTree, parseCommitFast } from './gitpack.ts';
+import { writePack, parsePackEntries, parseTag, parseTree, parseCommitFast } from './gitpack.ts';
 import { jsonRes, frameHttp, type Req, type Res } from './http.ts';
 import type { Repo, Store } from './store.ts';
 
@@ -16,12 +16,11 @@ const V2_ADVERTISEMENT: Buffer = pktLines([
   'fetch=shallow\n',
   'ls-refs=unborn\n',
   'object-format=sha1\n',
-  'agent=makefun-git-client/1.0\n',
   'flush',
 ]);
 
 const UPLOAD_V0_CAPS = 'symref=HEAD:refs/heads/main side-band-64k ofs-delta thin-pack multi_ack_detailed shallow agent=makefun-git-client/1.0';
-const RECEIVE_V0_CAPS = 'report-status report-status-v2 side-band-64k delete-refs ofs-delta agent=makefun-git-client/1.0';
+const RECEIVE_V0_CAPS = 'report-status report-status-v2 side-band-64k delete-refs ofs-delta';
 
 /** Complete framed HTTP/1.1 200 response for GET info/refs?service=git-upload-pack
  * with git-protocol: version=2 (the clone workload's advertisement). Constant. */
@@ -46,9 +45,16 @@ const RECV_INFO_BODY_TEMPLATE: Buffer = Buffer.concat([
   pkt(`${DUMMY_OID} refs/heads/main\0${RECEIVE_V0_CAPS}\n`),
   PKT_FLUSH,
 ]);
-const RECV_INFO_BODY_OID_OFF = RECV_INFO_BODY_TEMPLATE.indexOf(Buffer.from(DUMMY_OID, 'ascii'));
+/** Offset of the 40-char OID placeholder inside the body template. Always 35:
+ * the 31-byte service pkt-line ('001f' + 27-char payload) + the 4-byte pkt
+ * header of the ref line. Computed arithmetically, NOT by indexOf(DUMMY_OID):
+ * when the ref pkt length ends in '0' (e.g. 0x80) that '0' merges with the
+ * 40-zero OID into a 41-zero run and indexOf lands one byte early — the OID
+ * write then overwrites the length digit (0080 -> 0086) and desynchronizes
+ * the client's pkt parser. */
+const RECV_INFO_BODY_OID_OFF = 35;
 const RECV_INFO_TEMPLATE: Buffer = frameHttp(200, [`content-type: ${RECEIVE_AD_CT}`], RECV_INFO_BODY_TEMPLATE);
-const RECV_INFO_OID_OFF = RECV_INFO_TEMPLATE.indexOf(Buffer.from(DUMMY_OID, 'ascii'));
+const RECV_INFO_OID_OFF = (RECV_INFO_TEMPLATE.length - RECV_INFO_BODY_TEMPLATE.length) + RECV_INFO_BODY_OID_OFF;
 
 /** The tip OID of a single-ref main repo (not a tag), or null otherwise. */
 function singleMainOid(repo: Repo): string | null {
@@ -233,6 +239,7 @@ function handleLsRefs(store: Store, req: Req, owner: string, repoName: string): 
   const framed = framedGitRes(UPLOAD_RES_CT, buf);
   const v2 = req.headers.get('git-protocol') === 'version=2';
   repo.uploadPackCache.set(uploadPackKey(req.body, v2), { version: repo.version, buf: framed });
+  repo.lsRefsSlot = { req: Buffer.from(req.body), resp: framed, v2, version: repo.version };
   return { status: 200, headers: { 'content-type': UPLOAD_RES_CT }, body: buf, rawHttpBuf: framed };
 }
 
@@ -242,12 +249,36 @@ function uploadPackKey(body: Buffer, v2: boolean): string {
   return body.toString('latin1') + (v2 ? '2' : '0');
 }
 
+/** Which inline slot a body belongs to ('ls' | 'fetch'), or null when the
+ * body does not start with a command pkt-line (fall back to the Map).
+ * The first pkt-line is 4 hex length + 'command=ls-refs\n' or
+ * 'command=fetch\n'; the distinguishing byte is at offset 12 ('l' vs 'f'),
+ * bytes 4..11 read 'command='. */
+function uploadSlotFor(body: Buffer): 'ls' | 'fetch' | null {
+  if (body.length < 14) return null;
+  if (
+    body[4] !== 0x63 || body[5] !== 0x6f || body[6] !== 0x6d || body[7] !== 0x6d ||
+    body[8] !== 0x61 || body[9] !== 0x6e || body[10] !== 0x64 || body[11] !== 0x3d
+  ) return null;
+  if (body[12] === 0x6c) return 'ls'; // 'l'
+  if (body[12] === 0x66) return 'fetch'; // 'f'
+  return null;
+}
+
 /** Fast-path lookup for a POST git-upload-pack: the complete framed HTTP
  * response for this exact request body, or null to fall back to the full
  * path (which parses, builds, and populates this cache). The entry is
  * versioned against the repo, so a mutated repo never serves a stale pack. */
 export function uploadPackFastBuf(repo: Repo, body: Buffer, v2: boolean): Buffer | null {
   if (body.length > 4096) return null;
+  // 2-slot inline cache first: Buffer.equals is C++ memcmp, zero string
+  // allocation. A discriminator miss or an equals miss falls through to the
+  // Map — the equals check makes a wrong-slot hit impossible.
+  const slot = uploadSlotFor(body);
+  if (slot !== null) {
+    const s = slot === 'ls' ? repo.lsRefsSlot : repo.fetchSlot;
+    if (s.req !== null && s.version === repo.version && s.v2 === v2 && body.equals(s.req)) return s.resp as Buffer;
+  }
   const hit = repo.uploadPackCache.get(uploadPackKey(body, v2));
   if (hit === undefined || hit.version !== repo.version) return null;
   return hit.buf;
@@ -475,6 +506,7 @@ function handleFetch(store: Store, req: Req, owner: string, repoName: string): R
   // under the raw request body so the fast path can serve it without parsing.
   const framed = framedGitRes(UPLOAD_RES_CT, buf);
   repo.uploadPackCache.set(uploadPackKey(req.body, v2), { version: repo.version, buf: framed });
+  repo.fetchSlot = { req: Buffer.from(req.body), resp: framed, v2, version: repo.version };
   return { status: 200, headers: { 'content-type': UPLOAD_RES_CT }, body: buf, rawHttpBuf: framed };
 }
 
@@ -530,14 +562,79 @@ function isAncestor(repo: Repo, ancestor: string, oid: string): boolean {
   return false;
 }
 
-function handleReceivePack(store: Store, req: Req, owner: string, repoName: string): Res {
-  const repo = store.getRepo(owner, repoName);
-  if (repo === undefined) return notFound();
+/** Apply the ref updates of a successfully unpacked push. Shared by the full
+ * and fast paths so both produce identical reports and state. */
+function applyPushCommands(repo: Repo, commands: PushCommand[]): { reportLines: string[]; changed: boolean } {
+  const reportLines: string[] = [];
+  let changed = false;
+  for (const cmd of commands) {
+    const current = repo.refs.get(cmd.ref);
+    if (cmd.newOid === ZERO_OID) {
+      // Delete.
+      if (current === undefined) {
+        reportLines.push(`ng ${cmd.ref} failed to delete\n`);
+      } else if (current.toLowerCase() !== cmd.oldOid.toLowerCase()) {
+        reportLines.push(`ng ${cmd.ref} non-fast-forward\n`);
+      } else {
+        repo.refs.delete(cmd.ref);
+        changed = true;
+        reportLines.push(`ok ${cmd.ref}\n`);
+      }
+      continue;
+    }
+    if (cmd.oldOid === ZERO_OID) {
+      // Create.
+      if (current !== undefined) {
+        reportLines.push(`ng ${cmd.ref} already exists\n`);
+        continue;
+      }
+      if (!repo.objects.has(cmd.newOid)) {
+        reportLines.push(`ng ${cmd.ref} object not found\n`);
+        continue;
+      }
+      repo.refs.set(cmd.ref, cmd.newOid);
+      changed = true;
+      reportLines.push(`ok ${cmd.ref}\n`);
+      continue;
+    }
+    // Update.
+    if (current === undefined) {
+      reportLines.push(`ng ${cmd.ref} non-fast-forward\n`);
+      continue;
+    }
+    if (current.toLowerCase() !== cmd.oldOid.toLowerCase()) {
+      reportLines.push(`ng ${cmd.ref} non-fast-forward\n`);
+      continue;
+    }
+    if (cmd.newOid.toLowerCase() === cmd.oldOid.toLowerCase()) {
+      reportLines.push(`ok ${cmd.ref}\n`);
+      continue;
+    }
+    if (!repo.objects.has(cmd.newOid)) {
+      reportLines.push(`ng ${cmd.ref} object not found\n`);
+      continue;
+    }
+    if (isAncestor(repo, cmd.oldOid, cmd.newOid)) {
+      repo.refs.set(cmd.ref, cmd.newOid);
+      changed = true;
+      reportLines.push(`ok ${cmd.ref}\n`);
+    } else {
+      reportLines.push(`ng ${cmd.ref} non-fast-forward\n`);
+    }
+  }
+  return { reportLines, changed };
+}
+
+/** Apply a receive-pack request to a repo. Returns the framed HTTP response
+ * (and the body) for every well-formed request, or null when the body does
+ * not parse (caller answers 400). Shared by the full path and the fast path
+ * so both produce byte-identical responses and state. */
+function applyReceivePack(repo: Repo, body: Buffer): { framed: Buffer; body: Buffer } | null {
   let parsed: { commands: PushCommand[]; pack: Buffer };
   try {
-    parsed = parsePushCommands(req.body);
+    parsed = parsePushCommands(body);
   } catch {
-    return jsonRes(400, { message: 'Bad Request' });
+    return null;
   }
   const { commands, pack } = parsed;
   // Unpack first: every object must land before any ref moves.
@@ -545,15 +642,17 @@ function handleReceivePack(store: Store, req: Req, owner: string, repoName: stri
   let unpackDetail = 'ok';
   if (pack.length > 0) {
     try {
-      const objects = readPack(pack);
-      for (const [oid, obj] of objects) {
-        if (!repo.objects.has(oid)) {
-          repo.objects.set(oid, obj);
-          if (obj.type === 'commit') {
+      // Zero-alloc unpack: entries validated into a small array first, then
+      // committed — a bad pack never lands partially (100% atomic).
+      const entries = parsePackEntries(pack);
+      for (const e of entries) {
+        if (!repo.objects.has(e.oid)) {
+          repo.objects.set(e.oid, { type: e.type, data: e.data });
+          if (e.type === 'commit') {
             try {
-              const c = parseCommitFast(obj.data);
-              repo.commitParents.set(oid, c.parents);
-              repo.commitTree.set(oid, c.tree);
+              const c = parseCommitFast(e.data);
+              repo.commitParents.set(e.oid, c.parents);
+              repo.commitTree.set(e.oid, c.tree);
             } catch {
               // A commit that does not parse still stores; its parents stay unknown.
             }
@@ -568,72 +667,37 @@ function handleReceivePack(store: Store, req: Req, owner: string, repoName: stri
   const reportLines: string[] = [unpackOk ? 'unpack ok\n' : `unpack ${unpackDetail}\n`];
   let changed = false;
   if (unpackOk) {
-    for (const cmd of commands) {
-      const current = repo.refs.get(cmd.ref);
-      if (cmd.newOid === ZERO_OID) {
-        // Delete.
-        if (current === undefined) {
-          reportLines.push(`ng ${cmd.ref} failed to delete\n`);
-        } else if (current.toLowerCase() !== cmd.oldOid.toLowerCase()) {
-          reportLines.push(`ng ${cmd.ref} non-fast-forward\n`);
-        } else {
-          repo.refs.delete(cmd.ref);
-          changed = true;
-          reportLines.push(`ok ${cmd.ref}\n`);
-        }
-        continue;
-      }
-      if (cmd.oldOid === ZERO_OID) {
-        // Create.
-        if (current !== undefined) {
-          reportLines.push(`ng ${cmd.ref} already exists\n`);
-          continue;
-        }
-        if (!repo.objects.has(cmd.newOid)) {
-          reportLines.push(`ng ${cmd.ref} object not found\n`);
-          continue;
-        }
-        repo.refs.set(cmd.ref, cmd.newOid);
-        changed = true;
-        reportLines.push(`ok ${cmd.ref}\n`);
-        continue;
-      }
-      // Update.
-      if (current === undefined) {
-        reportLines.push(`ng ${cmd.ref} non-fast-forward\n`);
-        continue;
-      }
-      if (current.toLowerCase() !== cmd.oldOid.toLowerCase()) {
-        reportLines.push(`ng ${cmd.ref} non-fast-forward\n`);
-        continue;
-      }
-      if (cmd.newOid.toLowerCase() === cmd.oldOid.toLowerCase()) {
-        reportLines.push(`ok ${cmd.ref}\n`);
-        continue;
-      }
-      if (!repo.objects.has(cmd.newOid)) {
-        reportLines.push(`ng ${cmd.ref} object not found\n`);
-        continue;
-      }
-      if (isAncestor(repo, cmd.oldOid, cmd.newOid)) {
-        repo.refs.set(cmd.ref, cmd.newOid);
-        changed = true;
-        reportLines.push(`ok ${cmd.ref}\n`);
-      } else {
-        reportLines.push(`ng ${cmd.ref} non-fast-forward\n`);
-      }
-    }
+    const applied = applyPushCommands(repo, commands);
+    reportLines.push(...applied.reportLines);
+    changed = applied.changed;
   }
   if (changed) repo.touch();
   // Report inside sideband band 1 (side-band-64k is always advertised), then a flush.
   // Common case (one command, unpack ok, ok refs/heads/main): the pre-built
   // framed response is byte-identical to building it here.
   if (reportLines.length === 2 && reportLines[0] === 'unpack ok\n' && reportLines[1] === 'ok refs/heads/main\n') {
-    return { status: 200, headers: { 'content-type': RECEIVE_RES_CT }, body: PUSH_OK_MAIN_BODY, rawHttpBuf: PUSH_OK_MAIN_HTTP_BUF };
+    return { framed: PUSH_OK_MAIN_HTTP_BUF, body: PUSH_OK_MAIN_BODY };
   }
   const reportStream = pktLines([...reportLines, 'flush']);
-  const body = Buffer.concat([sideband(1, reportStream), PKT_FLUSH]);
-  return gitRes(200, RECEIVE_RES_CT, body);
+  const b = Buffer.concat([sideband(1, reportStream), PKT_FLUSH]);
+  return { framed: frameHttp(200, [`content-type: ${RECEIVE_RES_CT}`], b), body: b };
+}
+
+function handleReceivePack(store: Store, req: Req, owner: string, repoName: string): Res {
+  const repo = store.getRepo(owner, repoName);
+  if (repo === undefined) return notFound();
+  const r = applyReceivePack(repo, req.body);
+  if (r === null) return jsonRes(400, { message: 'Bad Request' });
+  return { status: 200, headers: { 'content-type': RECEIVE_RES_CT }, body: r.body, rawHttpBuf: r.framed };
+}
+
+/** Fast-path POST git-receive-pack: the complete framed HTTP response, or
+ * null to fall back to the full parser (unparseable body — answered 400
+ * there). Never returns null after mutating: null means the body did not
+ * parse, which happens before any unpack or ref move. */
+export function fastReceivePack(repo: Repo, body: Buffer): Buffer | null {
+  const r = applyReceivePack(repo, body);
+  return r === null ? null : r.framed;
 }
 
 // ---------------------------------------------------------------- dispatch

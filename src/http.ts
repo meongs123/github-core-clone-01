@@ -159,7 +159,9 @@ interface FastHead {
 
 /** Parse the request line + headers of one complete HTTP/1.1 request from the
  * raw chunk bytes, in a single pass, with no toString of the head, no split,
- * no regex, no Map. Returns null when the request is not fast-path shaped. */
+ * no regex, no Map. Returns null when the request is not fast-path shaped.
+ * Fills and returns the module scratch head (synchronous dispatch only). */
+const SCRATCH_HEAD: FastHead = { method: '', target: '', contentLength: 0, auth: null, gitProtocolV2: false, keepAlive: true, chunked: false };
 function scanFastHead(chunk: Buffer, headerEnd: number): FastHead | null {
   const lineEnd = chunk.indexOf('\r\n', 0);
   if (lineEnd < 0 || lineEnd > headerEnd) return null;
@@ -167,14 +169,27 @@ function scanFastHead(chunk: Buffer, headerEnd: number): FastHead | null {
   if (sp1 < 0 || sp1 >= lineEnd) return null;
   const sp2 = chunk.indexOf(0x20, sp1 + 1);
   if (sp2 < 0 || sp2 >= lineEnd) return null;
-  const method = chunk.toString('ascii', 0, sp1);
+  // Method by bytes (GET / POST only — the fast dispatcher serves nothing
+  // else, so any other method falls back to the full parser). No toString.
+  let method: string;
+  if (sp1 === 3 && chunk[0] === 0x47 && chunk[1] === 0x45 && chunk[2] === 0x54) method = 'GET';
+  else if (sp1 === 4 && chunk[0] === 0x50 && chunk[1] === 0x4f && chunk[2] === 0x53 && chunk[3] === 0x54) method = 'POST';
+  else return null;
+  // Version by bytes: 'HTTP/1.1' (8 bytes). No toString.
+  if (lineEnd - (sp2 + 1) !== 8) return null;
+  if (
+    chunk[sp2 + 1] !== 0x48 || chunk[sp2 + 2] !== 0x54 || chunk[sp2 + 3] !== 0x54 || chunk[sp2 + 4] !== 0x50 ||
+    chunk[sp2 + 5] !== 0x2f || chunk[sp2 + 6] !== 0x31 || chunk[sp2 + 7] !== 0x2e || chunk[sp2 + 8] !== 0x31
+  ) return null;
   const target = chunk.toString('ascii', sp1 + 1, sp2);
-  if (chunk.toString('ascii', sp2 + 1, lineEnd) !== 'HTTP/1.1') return null;
-  let contentLength = 0;
-  let auth: Buffer | null = null;
-  let gitProtocolV2 = false;
-  let keepAlive = true;
-  let chunked = false;
+  const head = SCRATCH_HEAD;
+  head.method = method;
+  head.target = target;
+  head.contentLength = 0;
+  head.auth = null;
+  head.gitProtocolV2 = false;
+  head.keepAlive = true;
+  head.chunked = false;
   let i = lineEnd + 2;
   while (i < headerEnd) {
     const eol = chunk.indexOf('\r\n', i);
@@ -186,21 +201,35 @@ function scanFastHead(chunk: Buffer, headerEnd: number): FastHead | null {
     while (vStart < eol && (chunk[vStart] === 0x20 || chunk[vStart] === 0x09)) vStart += 1;
     let vEnd = eol;
     while (vEnd > vStart && (chunk[vEnd - 1] === 0x20 || chunk[vEnd - 1] === 0x09)) vEnd -= 1;
-    if (nameEq(chunk, i, nameLen, 'authorization')) {
-      auth = chunk.subarray(vStart, vEnd);
-    } else if (nameEq(chunk, i, nameLen, 'content-length')) {
-      contentLength = parseDec(chunk, vStart, vEnd);
-      if (contentLength < 0) return null;
-    } else if (nameEq(chunk, i, nameLen, 'git-protocol')) {
-      gitProtocolV2 = valueEq(chunk, vStart, vEnd, 'version=2');
-    } else if (nameEq(chunk, i, nameLen, 'connection')) {
-      keepAlive = !valueEq(chunk, vStart, vEnd, 'close');
-    } else if (nameEq(chunk, i, nameLen, 'transfer-encoding')) {
-      chunked = valueContains(chunk, vStart, vEnd, 'chunked');
+    // Dispatch on the header-name length (all five names we care about have
+    // distinct lengths: 10/12/13/14/17), then one nameEq to verify — instead
+    // of five nameEq calls per header. nameEq compares byte-by-byte and fails
+    // fast on the first byte, so a separate first-byte pre-check adds nothing.
+    switch (nameLen) {
+      case 13:
+        if (nameEq(chunk, i, nameLen, 'authorization')) head.auth = chunk.subarray(vStart, vEnd);
+        break;
+      case 14:
+        if (nameEq(chunk, i, nameLen, 'content-length')) {
+          head.contentLength = parseDec(chunk, vStart, vEnd);
+          if (head.contentLength < 0) return null;
+        }
+        break;
+      case 12:
+        if (nameEq(chunk, i, nameLen, 'git-protocol')) head.gitProtocolV2 = valueEq(chunk, vStart, vEnd, 'version=2');
+        break;
+      case 10:
+        if (nameEq(chunk, i, nameLen, 'connection')) head.keepAlive = !valueEq(chunk, vStart, vEnd, 'close');
+        break;
+      case 17:
+        if (nameEq(chunk, i, nameLen, 'transfer-encoding')) head.chunked = valueContains(chunk, vStart, vEnd, 'chunked');
+        break;
+      default:
+        break;
     }
     i = eol + 2;
   }
-  return { method, target, contentLength, auth, gitProtocolV2, keepAlive, chunked };
+  return head;
 }
 
 /** True when the head bytes (up to headerEnd) carry `Expect: 100-continue`.
@@ -228,40 +257,46 @@ function hasExpectContinue(buf: Buffer, headerEnd: number): boolean {
   return false;
 }
 
-/** Try the zero-alloc fast path for one chunk that holds exactly one complete
- * HTTP/1.1 request. Returns true when the request was answered (the chunk is
- * fully consumed); false to fall back to the full parser. */
-function tryFastHandle(chunk: Buffer, socket: Socket, handler: Handler & { fast?: FastHandler }, fastAuthBuf: Buffer | null): boolean {
+/** Module scratch for the fast-path request view (synchronous dispatch only:
+ * filled, handed to the dispatcher, and never retained past the call). */
+const SCRATCH_REQ: FastReq = { method: '', path: '', query: '', body: EMPTY_BUF, keepAlive: true, gitProtocolV2: false };
+
+/** Try the zero-alloc fast path for the request at the START of `buf`.
+ * Returns the number of bytes consumed (> 0) when one complete request at
+ * the front of `buf` was answered, or 0 when `buf` holds no complete
+ * fast-path request (incomplete body, chunked, unauthenticated, or
+ * unshaped) — the caller then falls back to the full parser on the same
+ * buffer. Leftover bytes (a pipelined next request) stay in `buf` for the
+ * next loop iteration. */
+function tryFastHandleBuf(buf: Buffer, socket: Socket, handler: Handler & { fast?: FastHandler }, fastAuthBuf: Buffer | null): number {
   const fast = handler.fast;
-  if (fast === undefined) return false;
-  const headerEnd = chunk.indexOf('\r\n\r\n');
-  if (headerEnd < 0) return false;
-  const head = scanFastHead(chunk, headerEnd);
-  if (head === null || head.chunked) return false;
+  if (fast === undefined) return 0;
+  const headerEnd = buf.indexOf('\r\n\r\n');
+  if (headerEnd < 0) return 0;
+  const head = scanFastHead(buf, headerEnd);
+  if (head === null || head.chunked) return 0;
   const bodyStart = headerEnd + 4;
-  if (bodyStart + head.contentLength !== chunk.length) return false; // incomplete or pipelined
+  if (bodyStart + head.contentLength > buf.length) return 0; // incomplete body
   // Auth: the fast path only serves requests that already pass it; anything
   // else falls back to the full parser (which answers the 401).
   if (fastAuthBuf !== null) {
-    if (head.auth === null || !head.auth.equals(fastAuthBuf)) return false;
+    if (head.auth === null || !head.auth.equals(fastAuthBuf)) return 0;
   }
   // The fast path does no percent-decoding: a '%' in the target falls back.
-  if (head.target.indexOf('%') >= 0) return false;
+  if (head.target.indexOf('%') >= 0) return 0;
   const q = head.target.indexOf('?');
-  const path = q >= 0 ? head.target.slice(0, q) : head.target;
-  const query = q >= 0 ? head.target.slice(q + 1) : '';
-  const buf = fast({
-    method: head.method,
-    path,
-    query,
-    body: chunk.subarray(bodyStart, bodyStart + head.contentLength),
-    keepAlive: head.keepAlive,
-    gitProtocolV2: head.gitProtocolV2,
-  });
-  if (buf === null) return false;
-  socket.write(buf);
+  const req = SCRATCH_REQ;
+  req.method = head.method;
+  req.path = q >= 0 ? head.target.slice(0, q) : head.target;
+  req.query = q >= 0 ? head.target.slice(q + 1) : '';
+  req.body = buf.subarray(bodyStart, bodyStart + head.contentLength);
+  req.keepAlive = head.keepAlive;
+  req.gitProtocolV2 = head.gitProtocolV2;
+  const resp = fast(req);
+  if (resp === null) return 0;
+  socket.write(resp);
   if (!head.keepAlive) socket.end();
-  return true;
+  return bodyStart + head.contentLength;
 }
 
 interface Pending {
@@ -383,7 +418,8 @@ export class ForgeServer {
   }
 
   listen(port: number, cb: () => void): void {
-    this.server.listen(port, cb);
+    // Explicit backlog for the 50-concurrent-accept burst of the clone workload.
+    this.server.listen({ port, backlog: 511 }, cb);
   }
 
   address(): { port: number } | null {
@@ -400,11 +436,21 @@ export class ForgeServer {
     socket.setNoDelay(true);
     const state: Pending = { buf: EMPTY_BUF, continueSent: false };
     socket.on('data', (chunk: Buffer) => {
-      // Zero-alloc fast path: one complete request in this single chunk.
-      if (state.buf.length === 0 && tryFastHandle(chunk, socket, this.handler, this.fastAuthBuf)) return;
       state.buf = state.buf.length === 0 ? chunk : Buffer.concat([state.buf, chunk]);
       try {
         for (;;) {
+          // Zero-alloc fast path, on the merged buffer: a complete request at
+          // the front — whether it arrived in one chunk or the POST body
+          // arrived in a later TCP packet. Consumes exactly the request and
+          // loops for any pipelined remainder.
+          const consumed = tryFastHandleBuf(state.buf, socket, this.handler, this.fastAuthBuf);
+          if (consumed > 0) {
+            state.buf = consumed === state.buf.length ? EMPTY_BUF : state.buf.subarray(consumed);
+            state.continueSent = false;
+            if (socket.writableEnded) return;
+            if (state.buf.length === 0) break;
+            continue;
+          }
           // Answer Expect: 100-continue as soon as the headers are in — but
           // only for POST/PUT with a body not yet complete, in one byte pass.
           if (!state.continueSent) {

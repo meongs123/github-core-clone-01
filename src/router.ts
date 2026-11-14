@@ -7,7 +7,7 @@
 // answers pure cache hits straight from the socket buffer.
 import { jsonRes, frameHttp, type Req, type Res, type FastReq } from './http.ts';
 import type { Store } from './store.ts';
-import { handleGit, V2_INFO_REFS_HTTP_BUF, receivePackInfoRefsBuf, uploadPackFastBuf } from './git.ts';
+import { handleGit, V2_INFO_REFS_HTTP_BUF, receivePackInfoRefsBuf, uploadPackFastBuf, fastReceivePack } from './git.ts';
 import { handleRest, fastGetIssueBuf, fastCreateIssue } from './rest.ts';
 import { handleGraphql } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
@@ -132,7 +132,10 @@ export function createHandler(store: Store): FastableHandler {
           }
           if (freq.query === 'service=git-receive-pack') {
             // Push workload: single-ref main, template-filled.
-            return receivePackInfoRefsBuf(repo);
+            const r = receivePackInfoRefsBuf(repo);
+            if (r !== null) {
+              return r;
+            }
           }
           return null;
         }
@@ -145,7 +148,24 @@ export function createHandler(store: Store): FastableHandler {
         if (sub === 'git-upload-pack' && freq.method === 'POST') {
           const repo = store.getRepo(owner, repoName);
           if (repo === undefined) return null;
-          return uploadPackFastBuf(repo, freq.body, freq.gitProtocolV2);
+          const u = uploadPackFastBuf(repo, freq.body, freq.gitProtocolV2);
+          if (u !== null) {
+            return u;
+          }
+          return null;
+        }
+        // git-receive-pack POSTs (push): the whole push — unpack + ref move
+        // + report — runs in the fast path. A null means the body did not
+        // parse (answered 400 by the full parser); any well-formed push is
+        // answered here, so all 200 sequential pushes skip tryParse.
+        if (sub === 'git-receive-pack' && freq.method === 'POST') {
+          const repo = store.getRepo(owner, repoName);
+          if (repo === undefined) return null;
+          const r = fastReceivePack(repo, freq.body);
+          if (r !== null) {
+            return r;
+          }
+          return null;
         }
         return null;
       }
@@ -161,12 +181,20 @@ export function createHandler(store: Store): FastableHandler {
           if (!Number.isSafeInteger(num) || num < 1 || tail.slice('issues/'.length).includes('/')) return null;
           const repo = store.getRepo(owner, repoName);
           if (repo === undefined) return null;
-          return fastGetIssueBuf(store, repo, num);
+          const g = fastGetIssueBuf(store, repo, num);
+          if (g !== null) {
+            return g;
+          }
+          return null;
         }
         if (freq.method === 'POST' && tail === 'issues' && freq.query === '') {
           const repo = store.getRepo(owner, repoName);
           if (repo === undefined) return null;
-          return fastCreateIssue(store, repo, freq.body);
+          const c = fastCreateIssue(store, repo, freq.body);
+          if (c !== null) {
+            return c;
+          }
+          return null;
         }
       }
     }
