@@ -4,7 +4,6 @@
 // HTTP 200 with an errors array naming the field (the suite's one errors case).
 import { jsonRes, type Req, type Res } from './http.ts';
 import type { Store, Repo, Issue, Pull } from './store.ts';
-import { VIEWER_LOGIN } from './store.ts';
 import { b64encode, b64decode } from './util.ts';
 
 // ------------------------------------------------------------ tokenizer
@@ -577,7 +576,7 @@ function resolveRootQuery(ctx: ExecCtx, sel: Selection): unknown {
   const args = argMap(sel, ctx.vars);
   switch (sel.name) {
     case 'viewer': {
-      const n: NodeValue = { __typename: 'User', login: VIEWER_LOGIN };
+      const n: NodeValue = { __typename: 'User', login: store.viewerLogin };
       return sel.selectionSet === null ? n : executeSelection(ctx, n, sel.selectionSet);
     }
     case 'repository': {
@@ -666,6 +665,7 @@ function resolveRootMutation(ctx: ExecCtx, sel: Selection): unknown {
         issue.state = 'closed';
         issue.updatedSeq = store.counter;
         issue.cachedBuf = null;
+        issue.cachedHttpBuf = null;
         const n: NodeValue = { __typename: 'Issue', repo, issue };
         const out: Record<string, unknown> = {};
         for (const s of sel.selectionSet ?? []) {
@@ -724,6 +724,7 @@ function resolveRootMutation(ctx: ExecCtx, sel: Selection): unknown {
         issue.comments.push(comment);
         issue.updatedSeq = store.counter;
         issue.cachedBuf = null;
+        issue.cachedHttpBuf = null;
         const edge: NodeValue = { __typename: 'CommentEdge', repo, issue, commentId: comment.dbid, body: comment.body };
         const out: Record<string, unknown> = {};
         for (const s of sel.selectionSet ?? []) {

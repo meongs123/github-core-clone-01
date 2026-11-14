@@ -13,10 +13,34 @@ export function sha1Buf(data: Buffer): Buffer {
   return createHash('sha1').update(data).digest();
 }
 
-/** git object id: SHA-1 over "<type> <len>\0" + bytes. */
+/** git object id: SHA-1 over "<type> <len>\0" + bytes. Chained update: zero copy. */
 export function hashObject(type: string, data: Buffer): string {
-  const head = Buffer.from(`${type} ${data.length}\0`, 'ascii');
-  return sha1Hex(Buffer.concat([head, data]));
+  return createHash('sha1').update(`${type} ${data.length}\0`, 'ascii').update(data).digest('hex');
+}
+
+/** Parse 4 hex chars at `off` into a number; -1 when any char is not hex. No regex. */
+export function parseHex4(buf: Buffer, off: number): number {
+  let v = 0;
+  for (let i = 0; i < 4; i += 1) {
+    const c = buf[off + i] as number;
+    let d: number;
+    if (c >= 48 && c <= 57) d = c - 48; // 0-9
+    else if (c >= 97 && c <= 102) d = c - 87; // a-f
+    else if (c >= 65 && c <= 70) d = c - 55; // A-F
+    else return -1;
+    v = (v << 4) | d;
+  }
+  return v;
+}
+
+/** True when `s` is exactly 40 lowercase hex chars. No regex. */
+export function isHex40(s: string): boolean {
+  if (s.length !== 40) return false;
+  for (let i = 0; i < 40; i += 1) {
+    const c = s.charCodeAt(i);
+    if (!((c >= 48 && c <= 57) || (c >= 97 && c <= 102))) return false;
+  }
+  return true;
 }
 
 /** One pkt-line data packet for a string/Buffer payload (payload must fit). */

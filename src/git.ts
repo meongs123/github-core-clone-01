@@ -1,8 +1,8 @@
 // Git smart HTTP: upload-pack v2/v0, receive-pack v0, ls-refs, fetch, push.
 // Wire formats follow the kit's git-client exactly (see spec/git-spec.md).
-import { pkt, pktLines, PKT_FLUSH, sideband, ZERO_OID } from './util.ts';
-import { writePack, readPack, parseTag, parseTree, parseCommit } from './gitpack.ts';
-import { jsonRes, type Req, type Res } from './http.ts';
+import { pkt, pktLines, PKT_FLUSH, sideband, ZERO_OID, parseHex4 } from './util.ts';
+import { writePack, readPack, parseTag, parseTree, parseCommitFast } from './gitpack.ts';
+import { jsonRes, frameHttp, type Req, type Res } from './http.ts';
 import type { Repo, Store } from './store.ts';
 
 const UPLOAD_AD_CT = 'application/x-git-upload-pack-advertisement';
@@ -22,6 +22,67 @@ const V2_ADVERTISEMENT: Buffer = pktLines([
 
 const UPLOAD_V0_CAPS = 'symref=HEAD:refs/heads/main side-band-64k ofs-delta thin-pack multi_ack_detailed shallow agent=makefun-git-client/1.0';
 const RECEIVE_V0_CAPS = 'report-status report-status-v2 side-band-64k delete-refs ofs-delta agent=makefun-git-client/1.0';
+
+/** Complete framed HTTP/1.1 200 response for GET info/refs?service=git-upload-pack
+ * with git-protocol: version=2 (the clone workload's advertisement). Constant. */
+export const V2_INFO_REFS_HTTP_BUF: Buffer = frameHttp(200, [`content-type: ${UPLOAD_AD_CT}`], V2_ADVERTISEMENT);
+
+/** Complete framed HTTP/1.1 200 response for the common push report: unpack ok
+ * + ok refs/heads/main in sideband-64k. Constant; returned only when the
+ * computed report lines match exactly. */
+const PUSH_OK_MAIN_BODY: Buffer = (() => {
+  const reportStream = pktLines(['unpack ok\n', 'ok refs/heads/main\n', 'flush']);
+  return Buffer.concat([sideband(1, reportStream), PKT_FLUSH]);
+})();
+const PUSH_OK_MAIN_HTTP_BUF: Buffer = frameHttp(200, [`content-type: ${RECEIVE_RES_CT}`], PUSH_OK_MAIN_BODY);
+
+/** Framed v0 receive-pack advertisement for a single-ref `refs/heads/main`
+ * repo, with a 40-char placeholder OID. The body template is framed once;
+ * per request the template is copied and the live OID written into the
+ * placeholder slot (body and framed variants share the shape check). */
+const DUMMY_OID = '0'.repeat(40);
+const RECV_INFO_BODY_TEMPLATE: Buffer = Buffer.concat([
+  pkt('# service=git-receive-pack\n'),
+  pkt(`${DUMMY_OID} refs/heads/main\0${RECEIVE_V0_CAPS}\n`),
+  PKT_FLUSH,
+]);
+const RECV_INFO_BODY_OID_OFF = RECV_INFO_BODY_TEMPLATE.indexOf(Buffer.from(DUMMY_OID, 'ascii'));
+const RECV_INFO_TEMPLATE: Buffer = frameHttp(200, [`content-type: ${RECEIVE_AD_CT}`], RECV_INFO_BODY_TEMPLATE);
+const RECV_INFO_OID_OFF = RECV_INFO_TEMPLATE.indexOf(Buffer.from(DUMMY_OID, 'ascii'));
+
+/** The tip OID of a single-ref main repo (not a tag), or null otherwise. */
+function singleMainOid(repo: Repo): string | null {
+  if (repo.refs.size !== 1) return null;
+  const oid = repo.refs.get('refs/heads/main');
+  if (oid === undefined) return null;
+  if (peelTag(repo, 'refs/heads/main') !== null) return null;
+  return oid;
+}
+
+/** Framed receive-pack info/refs for a single-ref main repo (not a tag), with
+ * the live tip OID filled in. Null when the repo does not match the shape. */
+export function receivePackInfoRefsBuf(repo: Repo): Buffer | null {
+  const oid = singleMainOid(repo);
+  if (oid === null) return null;
+  const buf = Buffer.from(RECV_INFO_TEMPLATE);
+  buf.write(oid, RECV_INFO_OID_OFF, 'ascii');
+  return buf;
+}
+
+/** The same info/refs body without HTTP framing (the node:http variant writes
+ * the head itself). Null when the repo does not match the shape. */
+export function receivePackInfoRefsBody(repo: Repo): Buffer | null {
+  const oid = singleMainOid(repo);
+  if (oid === null) return null;
+  const buf = Buffer.from(RECV_INFO_BODY_TEMPLATE);
+  buf.write(oid, RECV_INFO_BODY_OID_OFF, 'ascii');
+  return buf;
+}
+
+/** Frame a git payload as a complete HTTP/1.1 200 response Buffer. */
+function framedGitRes(contentType: string, body: Buffer): Buffer {
+  return frameHttp(200, [`content-type: ${contentType}`], body);
+}
 
 function gitRes(status: number, contentType: string, body: Buffer): Res {
   return { status, headers: { 'content-type': contentType }, body };
@@ -90,8 +151,16 @@ function handleInfoRefs(store: Store, req: Req, owner: string, repoName: string)
   const repo = store.getRepo(owner, repoName);
   if (repo === undefined) return notFound();
   const v2 = req.headers.get('git-protocol') === 'version=2' && service === 'git-upload-pack';
-  if (v2) return gitRes(200, UPLOAD_AD_CT, V2_ADVERTISEMENT);
+  if (v2) return { status: 200, headers: { 'content-type': UPLOAD_AD_CT }, body: V2_ADVERTISEMENT, rawHttpBuf: V2_INFO_REFS_HTTP_BUF };
   const ct = service === 'git-upload-pack' ? UPLOAD_AD_CT : RECEIVE_AD_CT;
+  if (service === 'git-receive-pack') {
+    // Push workload: one ref, main. Template-fill the framed response.
+    const fast = receivePackInfoRefsBuf(repo);
+    if (fast !== null) {
+      const body = receivePackInfoRefsBody(repo);
+      return { status: 200, headers: { 'content-type': ct }, body: body ?? Buffer.alloc(0), rawHttpBuf: fast };
+    }
+  }
   const buf = cachedGit(repo, `info-v0-${service}`, () => v0Advertisement(repo, service));
   return gitRes(200, ct, buf);
 }
@@ -159,7 +228,29 @@ function handleLsRefs(store: Store, req: Req, owner: string, repoName: string): 
   const args = parseLsRefsArgs(payloads);
   const key = `lsrefs:${args.peel ? 1 : 0}:${args.symrefs ? 1 : 0}:${args.prefixes.join(',')}`;
   const buf = cachedGit(repo, key, () => lsRefsBody(repo, args));
-  return gitRes(200, UPLOAD_RES_CT, buf);
+  // Pre-framed response: one socket.write, no frameResponse. Also remember it
+  // under the raw request body so the fast path can serve it without parsing.
+  const framed = framedGitRes(UPLOAD_RES_CT, buf);
+  const v2 = req.headers.get('git-protocol') === 'version=2';
+  repo.uploadPackCache.set(uploadPackKey(req.body, v2), { version: repo.version, buf: framed });
+  return { status: 200, headers: { 'content-type': UPLOAD_RES_CT }, body: buf, rawHttpBuf: framed };
+}
+
+/** Cache key for an upload-pack request: the exact raw body bytes (latin1 is
+ * a 1:1 byte mapping) plus the protocol version flag. Small bodies only. */
+function uploadPackKey(body: Buffer, v2: boolean): string {
+  return body.toString('latin1') + (v2 ? '2' : '0');
+}
+
+/** Fast-path lookup for a POST git-upload-pack: the complete framed HTTP
+ * response for this exact request body, or null to fall back to the full
+ * path (which parses, builds, and populates this cache). The entry is
+ * versioned against the repo, so a mutated repo never serves a stale pack. */
+export function uploadPackFastBuf(repo: Repo, body: Buffer, v2: boolean): Buffer | null {
+  if (body.length > 4096) return null;
+  const hit = repo.uploadPackCache.get(uploadPackKey(body, v2));
+  if (hit === undefined || hit.version !== repo.version) return null;
+  return hit.buf;
 }
 
 /** Parse a pkt-line stream into data payloads; throws on malformed input. */
@@ -167,9 +258,8 @@ function parsePktStream(buf: Buffer): Buffer[] {
   const payloads: Buffer[] = [];
   let i = 0;
   while (i + 4 <= buf.length) {
-    const head = buf.toString('ascii', i, i + 4);
-    if (!/^[0-9a-fA-F]{4}$/.test(head)) throw new Error('invalid pkt-line length');
-    const len = parseInt(head, 16);
+    const len = parseHex4(buf, i);
+    if (len < 0) throw new Error('invalid pkt-line length');
     if (len === 0 || len === 1 || len === 2) {
       // flush / delim / response-end: control packets, skipped (a v0 fetch has two flushes).
       i += 4;
@@ -381,7 +471,11 @@ function handleFetch(store: Store, req: Req, owner: string, repoName: string): R
   }
   const key = `fetch:${v2 ? 2 : 0}:${args.wants.join(',')}|${args.haves.join(',')}|${args.shallow.join(',')}|${args.depth ?? ''}`;
   const buf = cachedGit(repo, key, () => fetchBody(repo, args, v2));
-  return gitRes(200, UPLOAD_RES_CT, buf);
+  // Pre-framed response: one socket.write, no frameResponse. Also remember it
+  // under the raw request body so the fast path can serve it without parsing.
+  const framed = framedGitRes(UPLOAD_RES_CT, buf);
+  repo.uploadPackCache.set(uploadPackKey(req.body, v2), { version: repo.version, buf: framed });
+  return { status: 200, headers: { 'content-type': UPLOAD_RES_CT }, body: buf, rawHttpBuf: framed };
 }
 
 // ---------------------------------------------------------------- receive-pack (push)
@@ -398,9 +492,8 @@ function parsePushCommands(body: Buffer): { commands: PushCommand[]; pack: Buffe
   let i = 0;
   let packStart = body.length;
   while (i + 4 <= body.length) {
-    const head = body.toString('ascii', i, i + 4);
-    if (!/^[0-9a-fA-F]{4}$/.test(head)) throw new Error('invalid pkt-line length');
-    const len = parseInt(head, 16);
+    const len = parseHex4(body, i);
+    if (len < 0) throw new Error('invalid pkt-line length');
     if (len === 0) {
       packStart = i + 4;
       break;
@@ -458,7 +551,7 @@ function handleReceivePack(store: Store, req: Req, owner: string, repoName: stri
           repo.objects.set(oid, obj);
           if (obj.type === 'commit') {
             try {
-              const c = parseCommit(obj.data);
+              const c = parseCommitFast(obj.data);
               repo.commitParents.set(oid, c.parents);
               repo.commitTree.set(oid, c.tree);
             } catch {
@@ -533,6 +626,11 @@ function handleReceivePack(store: Store, req: Req, owner: string, repoName: stri
   }
   if (changed) repo.touch();
   // Report inside sideband band 1 (side-band-64k is always advertised), then a flush.
+  // Common case (one command, unpack ok, ok refs/heads/main): the pre-built
+  // framed response is byte-identical to building it here.
+  if (reportLines.length === 2 && reportLines[0] === 'unpack ok\n' && reportLines[1] === 'ok refs/heads/main\n') {
+    return { status: 200, headers: { 'content-type': RECEIVE_RES_CT }, body: PUSH_OK_MAIN_BODY, rawHttpBuf: PUSH_OK_MAIN_HTTP_BUF };
+  }
   const reportStream = pktLines([...reportLines, 'flush']);
   const body = Buffer.concat([sideband(1, reportStream), PKT_FLUSH]);
   return gitRes(200, RECEIVE_RES_CT, body);
@@ -540,29 +638,24 @@ function handleReceivePack(store: Store, req: Req, owner: string, repoName: stri
 
 // ---------------------------------------------------------------- dispatch
 
-const GIT_PATH = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/;
-
-/** Handle a git smart-HTTP request; returns null when the path is not a git path. */
-export function handleGit(store: Store, req: Req): Res | null {
-  const m = GIT_PATH.exec(req.path);
-  if (m === null) return null;
-  const owner = m[1] as string;
-  const repoName = m[2] as string;
-  const tail = m[3] as string;
-  if (tail === 'info/refs') {
+/** Handle a git smart-HTTP request. The router already parsed the path (no
+ * second regex here): `owner`, `repoName` and `sub` come from its single
+ * path parse. Returns a Res for every git path the router matched. */
+export function handleGit(store: Store, req: Req, owner: string, repoName: string, sub: string): Res {
+  if (sub === 'info/refs') {
     if (req.method !== 'GET') return jsonRes(405, { message: 'Method Not Allowed' });
     return handleInfoRefs(store, req, owner, repoName);
   }
-  if (tail === 'git-upload-pack') {
+  if (sub === 'git-upload-pack') {
     if (req.method !== 'POST') return jsonRes(405, { message: 'Method Not Allowed' });
     // ls-refs vs fetch: the body starts with `command=ls-refs` or `command=fetch`.
     const head = req.body.length >= 4 ? req.body.toString('ascii', 0, Math.min(req.body.length, 64)) : '';
     if (head.includes('command=ls-refs')) return handleLsRefs(store, req, owner, repoName);
     return handleFetch(store, req, owner, repoName);
   }
-  if (tail === 'git-receive-pack') {
+  if (sub === 'git-receive-pack') {
     if (req.method !== 'POST') return jsonRes(405, { message: 'Method Not Allowed' });
     return handleReceivePack(store, req, owner, repoName);
   }
-  return null;
+  return jsonRes(404, { message: 'Not Found' });
 }

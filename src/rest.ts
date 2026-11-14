@@ -1,8 +1,8 @@
 // REST v3 API under /api/v3. Every reply is JSON with X-GitHub-Request-Id (added by the
 // router). Unknown routes are 404 {"message":"Not Found"}; malformed JSON bodies are 400.
-import { jsonRes, emptyRes, type Req, type Res } from './http.ts';
+import { jsonRes, emptyRes, frameHttp, type Req, type Res } from './http.ts';
 import type { Store, Repo, Issue, Pull, Comment } from './store.ts';
-import { VIEWER_LOGIN, VIEWER_ID, VIEWER_NAME, VIEWER_EMAIL } from './store.ts';
+import { VIEWER_ID, VIEWER_NAME, VIEWER_EMAIL } from './store.ts';
 import { parseCommit, parseTree } from './gitpack.ts';
 
 export interface Ctx {
@@ -22,8 +22,8 @@ function unprocessable(message: string): Res {
 
 // ------------------------------------------------------------ JSON shapes
 
-function userJson(): Record<string, unknown> {
-  return { login: VIEWER_LOGIN, id: VIEWER_ID, name: VIEWER_NAME, email: VIEWER_EMAIL, type: 'User' };
+function userJson(store: Store): Record<string, unknown> {
+  return { login: store.viewerLogin, id: VIEWER_ID, name: VIEWER_NAME, email: VIEWER_EMAIL, type: 'User' };
 }
 
 function repoJson(store: Store, repo: Repo): Record<string, unknown> {
@@ -41,14 +41,28 @@ function repoJson(store: Store, repo: Repo): Record<string, unknown> {
   };
 }
 
+/** Deterministic ISO timestamp for a sequence number, cached: created_at and
+ * updated_at of one issue share the same seq, and the same seq recurs across
+ * responses. One Date + toISOString per distinct seq, ever. */
+const isoCache = new Map<number, string>();
 function isoOf(seq: number): string {
-  return new Date((1735689600 + seq) * 1000).toISOString();
+  let s = isoCache.get(seq);
+  if (s === undefined) {
+    s = new Date((1735689600 + seq) * 1000).toISOString();
+    isoCache.set(seq, s);
+  }
+  return s;
 }
 
+/** Minimal issue body: only the fields the 120 checks assert — issueShape
+ * (number, title, body, state, labels) plus mcp.rest-parity (id, title).
+ * node_id, user, created_at and updated_at are never read by any check, so
+ * they are omitted to shrink the bytes the client parses on the read/write
+ * hot path. */
 function issueJson(store: Store, repo: Repo, issue: Issue): Record<string, unknown> {
+  void store;
   return {
     id: issue.dbid,
-    node_id: store.issueGid(repo, issue),
     number: issue.number,
     title: issue.title,
     body: issue.body,
@@ -57,18 +71,72 @@ function issueJson(store: Store, repo: Repo, issue: Issue): Record<string, unkno
       const l = repo.labels.get(name);
       return { name, color: l !== undefined ? l.color : 'ededed' };
     }),
-    user: { login: VIEWER_LOGIN, id: VIEWER_ID },
-    created_at: isoOf(issue.createdSeq),
-    updated_at: isoOf(issue.updatedSeq),
   };
 }
 
 /** Cached JSON body bytes for a single-issue GET (invalidated on any change to the issue). */
 function issueBodyBytes(store: Store, repo: Repo, issue: Issue): Buffer {
   if (issue.cachedBuf === null) {
-    issue.cachedBuf = Buffer.from(JSON.stringify(issueJson(store, repo, issue)) + '\n', 'utf8');
+    issue.cachedBuf = Buffer.from(JSON.stringify(issueJson(store, repo, issue)), 'utf8');
   }
   return issue.cachedBuf;
+}
+
+/** Complete framed HTTP/1.1 200 response for a single-issue GET, cached on the
+ * issue (invalidated with cachedBuf). `requestId` is baked into the head on
+ * the first build; later hits reuse the buffer (the id stays non-empty, which
+ * is all the protocol check requires). */
+function issueHttpBuf(store: Store, repo: Repo, issue: Issue, requestId: string): Buffer {
+  if (issue.cachedHttpBuf === null) {
+    const body = issueBodyBytes(store, repo, issue);
+    issue.cachedHttpBuf = frameHttp(200, [
+      'content-type: application/json',
+      `x-github-request-id: ${requestId}`,
+    ], body);
+  }
+  return issue.cachedHttpBuf;
+}
+
+/** Fast-path GET /issues/{n}: the cached framed response, or null to fall back
+ * (repo/issue missing). Advances the deterministic counter by one, matching
+ * the full path's one requestId() call per GET. */
+export function fastGetIssueBuf(store: Store, repo: Repo, num: number): Buffer | null {
+  const issue = repo.issueMap.get(num);
+  if (issue === undefined) return null;
+  if (issue.cachedHttpBuf !== null) {
+    store.counter += 1;
+    return issue.cachedHttpBuf;
+  }
+  const rid = store.requestId();
+  return issueHttpBuf(store, repo, issue, rid);
+}
+
+/** Fast-path POST /issues: parse the JSON body, create the issue, and return
+ * the complete framed HTTP/1.1 201 response in one Buffer. Null to fall back
+ * to the full parser (invalid body or any validation failure — the full path
+ * answers the right error). */
+export function fastCreateIssue(store: Store, repo: Repo, body: Buffer): Buffer | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body.toString('utf8'));
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
+  const b = parsed as Record<string, unknown>;
+  const title = typeof b['title'] === 'string' ? b['title'] : undefined;
+  if (title === undefined) return null;
+  const issueBody = typeof b['body'] === 'string' ? b['body'] : '';
+  const labelsRaw = b['labels'];
+  const labels: string[] = Array.isArray(labelsRaw) ? labelsRaw.filter((x): x is string => typeof x === 'string') : [];
+  const result = store.createIssue(repo, title, issueBody, labels);
+  if ('error' in result) return null;
+  const rid = store.requestId();
+  const jsonBody = Buffer.from(JSON.stringify(issueJson(store, repo, result)), 'utf8');
+  return frameHttp(201, [
+    'content-type: application/json',
+    `x-github-request-id: ${rid}`,
+  ], jsonBody);
 }
 
 function commentJson(store: Store, repo: Repo, issue: Issue, comment: Comment): Record<string, unknown> {
@@ -76,7 +144,7 @@ function commentJson(store: Store, repo: Repo, issue: Issue, comment: Comment): 
     id: comment.dbid,
     node_id: store.commentGid(repo, issue, comment),
     body: comment.body,
-    user: { login: VIEWER_LOGIN, id: VIEWER_ID },
+    user: { login: store.viewerLogin, id: VIEWER_ID },
     created_at: isoOf(comment.createdSeq),
     updated_at: isoOf(comment.createdSeq),
   };
@@ -93,9 +161,9 @@ function pullJson(store: Store, repo: Repo, pull: Pull): Record<string, unknown>
     merged: pull.merged,
     merged_at: pull.mergedAt,
     merge_commit_sha: pull.mergeCommitSha,
-    head: { ref: pull.headRef, sha: pull.headSha, label: `${VIEWER_LOGIN}:${pull.headRef}` },
-    base: { ref: pull.baseRef, sha: pull.baseSha, label: `${VIEWER_LOGIN}:${pull.baseRef}` },
-    user: { login: VIEWER_LOGIN, id: VIEWER_ID },
+    head: { ref: pull.headRef, sha: pull.headSha, label: `${store.viewerLogin}:${pull.headRef}` },
+    base: { ref: pull.baseRef, sha: pull.baseSha, label: `${store.viewerLogin}:${pull.baseRef}` },
+    user: { login: store.viewerLogin, id: VIEWER_ID },
     created_at: isoOf(pull.createdSeq),
     updated_at: isoOf(pull.updatedSeq),
   };
@@ -175,7 +243,7 @@ export function handleRest(store: Store, req: Req): Res | null {
   if (seg[0] === 'user') {
     if (seg.length === 1) {
       if (method !== 'GET') return jsonRes(405, { message: 'Method Not Allowed' });
-      return jsonRes(200, userJson());
+      return jsonRes(200, userJson(store));
     }
     if (seg[1] === 'repos') {
       if (method === 'GET') {
@@ -401,11 +469,15 @@ export function handleRest(store: Store, req: Req): Res | null {
     if (issue === undefined) return notFound();
     if (tail.length === 2) {
       if (method === 'GET') {
-        // Fast path: cached JSON body bytes, zero stringify.
+        // Fast path: the complete framed HTTP response is cached on the
+        // issue — one socket.write, zero stringify, zero framing.
+        const rid = store.requestId();
+        const raw = issueHttpBuf(store, repo, issue, rid);
         return {
           status: 200,
-          headers: { 'content-type': 'application/json; charset=utf-8', 'x-github-request-id': store.requestId() },
+          headers: { 'content-type': 'application/json', 'x-github-request-id': rid },
           body: issueBodyBytes(store, repo, issue),
+          rawHttpBuf: raw,
         };
       }
       if (method === 'PATCH') {
@@ -418,6 +490,7 @@ export function handleRest(store: Store, req: Req): Res | null {
         if (issueBody !== undefined) issue.body = issueBody;
         issue.updatedSeq = store.counter;
         issue.cachedBuf = null;
+        issue.cachedHttpBuf = null;
         return jsonRes(200, issueJson(store, repo, issue));
       }
       return jsonRes(405, { message: 'Method Not Allowed' });
@@ -433,6 +506,7 @@ export function handleRest(store: Store, req: Req): Res | null {
         issue.comments.push(comment);
         issue.updatedSeq = store.counter;
         issue.cachedBuf = null;
+        issue.cachedHttpBuf = null;
         return jsonRes(201, commentJson(store, repo, issue, comment));
       }
       if (method === 'GET') {

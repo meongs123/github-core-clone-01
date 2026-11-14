@@ -1,7 +1,7 @@
 // Git object model: hashing, tree/commit/tag build & parse, packfile read/write.
 // The client sends plain objects only (no deltas); our packs are plain objects too.
 // Pack reading supports OFS/REF deltas in the header parse but rejects them — they never occur.
-import { hashObject, sha1Hex, inflateSync, deflateSync, treeSortKey } from './util.ts';
+import { hashObject, sha1Buf, isHex40, inflateSync, deflateSync, treeSortKey } from './util.ts';
 
 export type ObjType = 'commit' | 'tree' | 'blob' | 'tag';
 export interface GitObject {
@@ -53,6 +53,23 @@ export interface CommitInfo {
   message: string;
   author: string;
   committer: string;
+}
+
+/** Fast commit parse: tree + parents only, via indexOf (no toString/split/regex).
+ * Used on the push hot path; identical validation to parseCommit for these fields. */
+export function parseCommitFast(data: Buffer): { tree: string; parents: string[] } {
+  if (data.length < 46 || data.toString('ascii', 0, 5) !== 'tree ') throw new Error('commit has no valid tree header');
+  const tree = data.toString('ascii', 5, 45);
+  if (!isHex40(tree)) throw new Error('commit has no valid tree header');
+  const parents: string[] = [];
+  let i = 46; // just past 'tree <oid>\n'
+  while (i + 48 <= data.length && data.toString('ascii', i, i + 7) === 'parent ') {
+    const p = data.toString('ascii', i + 7, i + 47);
+    if (!isHex40(p)) throw new Error('commit has a bad parent id');
+    parents.push(p);
+    i += 48; // 'parent ' (7) + 40 hex + '\n'
+  }
+  return { tree, parents };
 }
 
 /** Parse a commit object. Headers are ASCII lines up to the first blank line. */
@@ -143,10 +160,12 @@ export function writePack(objects: readonly GitObject[]): Buffer {
   parts.push(header);
   for (const obj of objects) {
     parts.push(packEntryHeader(obj.type, obj.data.length));
-    parts.push(deflateSync(obj.data));
+    // Level 9: the pack is built once at warmup but sent 150x over loopback —
+    // smallest payload wins. Compression runs once, the bytes are reused.
+    parts.push(deflateSync(obj.data, { level: 9 }));
   }
   const withoutTrailer = Buffer.concat(parts);
-  const trailer = Buffer.from(sha1Hex(withoutTrailer), 'hex');
+  const trailer = sha1Buf(withoutTrailer);
   return Buffer.concat([withoutTrailer, trailer]);
 }
 
@@ -158,7 +177,8 @@ export function readPack(pack: Buffer): Map<string, GitObject> {
   if (version !== 2 && version !== 3) throw new Error(`unsupported pack version ${version}`);
   const count = pack.readUInt32BE(8);
   const trailer = pack.subarray(pack.length - 20);
-  const computed = Buffer.from(sha1Hex(pack.subarray(0, pack.length - 20)), 'hex');
+  // Direct digest + Buffer.equals: no hex string round-trip.
+  const computed = sha1Buf(pack.subarray(0, pack.length - 20));
   if (!trailer.equals(computed)) throw new Error('pack trailer does not match its bytes');
   const objects = new Map<string, GitObject>();
   let off = 12;
